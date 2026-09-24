@@ -8,11 +8,13 @@ FinAlly (Finance Ally) is a visually stunning AI-powered trading workstation tha
 
 This is the capstone project for an agentic AI coding course. It is built entirely by Coding Agents demonstrating how orchestrated AI agents can produce a production-quality full-stack application. Agents interact through files in `planning/`.
 
+Beyond the course exercise, this app is intended to run as a real, internet-facing personal app on a self-managed VPS — not just a local demo. The portfolio remains simulated/paper-trading money indefinitely (no real brokerage integration is planned), but because it's reachable over the internet and the AI can execute trades autonomously, it needs a login gate, HTTPS, backups, and basic operational hardening from the start. See §7, §8, §9, §11 for what that adds to the base design.
+
 ## 2. User Experience
 
 ### First Launch
 
-The user runs a single Docker command (or a provided start script). A browser opens to `http://localhost:8000`. No login, no signup. They immediately see:
+The user runs a single Docker command (or a provided start script). A browser opens to the app's URL. On first boot, a single admin account is bootstrapped from environment variables (`ADMIN_EMAIL` / `ADMIN_PASSWORD`, see §5) — the deployer logs in once with that email/password. There is no public self-signup; this stays a single-user app for now, but the schema and auth layer (§7, §8) are built so multi-user signup can be enabled later without a rewrite. After logging in, they immediately see:
 
 - A watchlist of 10 default tickers with live-updating prices in a grid
 - $10,000 in virtual cash
@@ -79,6 +81,8 @@ The user runs a single Docker command (or a provided start script). A browser op
 | Single Docker container | Students run one command; no docker-compose for production, no service orchestration |
 | uv for Python | Fast, modern Python project management; reproducible lockfile; what students should learn |
 | Market orders only | Eliminates order book, limit order logic, partial fills — dramatically simpler portfolio math |
+| Single bootstrapped user + session auth (no public signup yet) | The app runs on a public VPS, so it needs a real login gate — but full multi-user signup isn't needed yet. The `users` table and `user_id` foreign keys (§7) are built now so multi-user support is a signup flow, not a schema rewrite |
+| Caddy reverse proxy for TLS | Automatic HTTPS via Let's Encrypt with minimal config; appropriate for a single-VPS deployment (§11) |
 
 ---
 
@@ -101,7 +105,8 @@ finally/
 ├── db/                       # Volume mount target (SQLite file lives here at runtime)
 │   └── .gitkeep              # Directory exists in repo; finally.db is gitignored
 ├── Dockerfile                # Multi-stage build (Node → Python)
-├── docker-compose.yml        # Optional convenience wrapper
+├── docker-compose.yml        # Runs the app + Caddy (reverse proxy/TLS) together for production
+├── Caddyfile                 # Caddy reverse proxy config (domain, automatic HTTPS, proxy to app)
 ├── .env                      # Environment variables (gitignored, .env.example committed)
 └── .gitignore
 ```
@@ -130,6 +135,13 @@ MASSIVE_API_KEY=
 
 # Optional: Set to "true" for deterministic mock LLM responses (testing)
 LLM_MOCK=false
+
+# Required in production: bootstraps the single admin account on first boot
+ADMIN_EMAIL=you@example.com
+ADMIN_PASSWORD=change-me-before-deploying
+
+# Required in production: signs session cookies. Generate with `openssl rand -hex 32`
+SESSION_SECRET=
 ```
 
 ### Behavior
@@ -138,6 +150,14 @@ LLM_MOCK=false
 - If `MASSIVE_API_KEY` is absent or empty → backend uses the built-in market simulator
 - If `LLM_MOCK=true` → backend returns deterministic mock LLM responses (for E2E tests)
 - The backend reads `.env` from the project root (mounted into the container or read via docker `--env-file`)
+- On first boot, if no row exists in `users`, the backend creates one from `ADMIN_EMAIL` / `ADMIN_PASSWORD` (password is hashed before storage, plaintext is never persisted). This only happens once — changing `ADMIN_EMAIL`/`ADMIN_PASSWORD` later does **not** retroactively update the existing `users` row (so a future in-app "change password" feature isn't silently overwritten on restart). To reset credentials manually before that feature exists, delete the `users` row via `sqlite3 db/finally.db` and restart the container to re-bootstrap
+- Sessions are stateless, signed cookies (signed with `SESSION_SECRET`, e.g. via `itsdangerous` or a JWT) — there is no server-side `sessions` table to manage or expire
+
+### Production Secrets Handling
+
+- `.env` lives only on the VPS — it is never committed, never baked into the Docker image (`COPY`'d), and is passed at run time via `docker run --env-file .env`
+- File permissions on the VPS are locked down (`chmod 600 .env`)
+- `SESSION_SECRET` and `ADMIN_PASSWORD` must be changed from any default/example value before the first production deploy
 
 ---
 
@@ -151,15 +171,16 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 - Generates prices using geometric Brownian motion (GBM) with configurable drift and volatility per ticker
 - Updates at ~500ms intervals
-- Correlated moves across tickers (e.g., tech stocks move together)
+- Correlated moves across tickers via simple sector grouping — tickers in the same group (e.g., a "tech" cluster: AAPL, GOOGL, MSFT, AMZN, NVDA, META) share a common noise factor each tick, so they tend to move together
 - Occasional random "events" — sudden 2-5% moves on a ticker for drama
 - Starts from realistic seed prices (e.g., AAPL ~$190, GOOGL ~$175, etc.)
 - Runs as an in-process background task — no external dependencies
+- Runs continuously, 24/7 — no market-hours gating (this is a simulator for demo purposes, always-on by design)
 
 ### Massive API (Optional)
 
 - REST API polling (not WebSocket) — simpler, works on all tiers
-- Polls for the union of all watched tickers on a configurable interval
+- Polls for the union of all watched tickers on a configurable interval, using a single batched/snapshot call that covers all watched tickers at once (not one call per ticker) — this is what keeps polling within free-tier rate limits regardless of watchlist size
 - Free tier (5 calls/min): poll every 15 seconds
 - Paid tiers: poll every 2-15 seconds depending on tier
 - Parses REST response into the same format as the simulator
@@ -185,55 +206,67 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 ### SQLite with Lazy Initialization
 
-The backend checks for the SQLite database on startup (or first request). If the file doesn't exist or tables are missing, it creates the schema and seeds default data. This means:
+The backend checks for the SQLite database on startup (or first request). If the file doesn't exist or tables are missing, it creates the schema and seeds default data (including bootstrapping the admin `users` row from `ADMIN_EMAIL`/`ADMIN_PASSWORD`). This means:
 
-- No separate migration step
+- No separate migration step for a fresh install
 - No manual database setup
 - Fresh Docker volumes start with a clean, seeded database automatically
+- WAL mode is enabled (`PRAGMA journal_mode=WAL`) for better concurrent read/write behavior under real traffic
+- **Once the app is live with real data**, "create if missing" is no longer sufficient for future schema changes — any change to an existing production database needs a proper versioned migration step (e.g., a small SQL migration runner, or Alembic), not a lazy-init rewrite. This only kicks in after the first production deploy; the initial build can ship without a migration framework.
+
+### Backups (production)
+
+Docker volumes protect against container removal, not disk failure or accidental data loss — they are not a backup by themselves. A cron job on the VPS runs a nightly `sqlite3 finally.db ".backup /backups/finally-$(date +%F).db"` and syncs the result to off-box storage (e.g., an S3-compatible bucket or a second machine). Restoring means stopping the container, replacing `db/finally.db` with a backup file, and restarting.
 
 ### Schema
 
-All tables include a `user_id` column defaulting to `"default"`. This is hardcoded for now (single-user) but enables future multi-user support without schema migration.
+All tables include a `user_id` column, a foreign key to `users.id`. Today there's exactly one row in `users` (the bootstrapped admin), so in practice every other table has one `user_id` value — but the schema is already shaped for multi-user support without a migration when that's needed.
+
+**users** — Account credentials (currently a single bootstrapped admin account)
+- `id` TEXT PRIMARY KEY (UUID)
+- `email` TEXT UNIQUE
+- `password_hash` TEXT (bcrypt or argon2 — plaintext password is never stored)
+- `created_at` TEXT (ISO timestamp)
 
 **users_profile** — User state (cash balance)
-- `id` TEXT PRIMARY KEY (default: `"default"`)
+- `id` TEXT PRIMARY KEY (references `users.id`)
 - `cash_balance` REAL (default: `10000.0`)
 - `created_at` TEXT (ISO timestamp)
 
 **watchlist** — Tickers the user is watching
 - `id` TEXT PRIMARY KEY (UUID)
-- `user_id` TEXT (default: `"default"`)
+- `user_id` TEXT (references `users.id`)
 - `ticker` TEXT
 - `added_at` TEXT (ISO timestamp)
 - UNIQUE constraint on `(user_id, ticker)`
 
 **positions** — Current holdings (one row per ticker per user)
 - `id` TEXT PRIMARY KEY (UUID)
-- `user_id` TEXT (default: `"default"`)
+- `user_id` TEXT (references `users.id`)
 - `ticker` TEXT
-- `quantity` REAL (fractional shares supported)
+- `quantity` REAL (fractional shares supported, rounded to 6 decimal places; no minimum trade size)
 - `avg_cost` REAL
 - `updated_at` TEXT (ISO timestamp)
 - UNIQUE constraint on `(user_id, ticker)`
 
 **trades** — Trade history (append-only log)
 - `id` TEXT PRIMARY KEY (UUID)
-- `user_id` TEXT (default: `"default"`)
+- `user_id` TEXT (references `users.id`)
 - `ticker` TEXT
 - `side` TEXT (`"buy"` or `"sell"`)
-- `quantity` REAL (fractional shares supported)
+- `quantity` REAL (fractional shares supported, rounded to 6 decimal places; no minimum trade size)
 - `price` REAL
 - `executed_at` TEXT (ISO timestamp)
 
-**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution.
+**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution. On a fresh start (no trades yet), the chart simply shows a single point at $10,000 — no synthetic history is backfilled. A background task prunes snapshots older than 7 days to keep the table bounded.
 - `id` TEXT PRIMARY KEY (UUID)
-- `user_id` TEXT (default: `"default"`)
+- `user_id` TEXT (references `users.id`)
 - `total_value` REAL
 - `recorded_at` TEXT (ISO timestamp)
 
 **chat_messages** — Conversation history with LLM
 - `id` TEXT PRIMARY KEY (UUID)
-- `user_id` TEXT (default: `"default"`)
+- `user_id` TEXT (references `users.id`)
 - `role` TEXT (`"user"` or `"assistant"`)
 - `content` TEXT
 - `actions` TEXT (JSON — trades executed, watchlist changes made; null for user messages)
@@ -241,12 +274,22 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 
 ### Default Seed Data
 
-- One user profile: `id="default"`, `cash_balance=10000.0`
-- Ten watchlist entries: AAPL, GOOGL, MSFT, AMZN, TSLA, NVDA, META, JPM, V, NFLX
+- One `users` row bootstrapped from `ADMIN_EMAIL` / `ADMIN_PASSWORD`
+- One user profile for that user: `cash_balance=10000.0`
+- Ten watchlist entries for that user: AAPL, GOOGL, MSFT, AMZN, TSLA, NVDA, META, JPM, V, NFLX
 
 ---
 
 ## 8. API Endpoints
+
+All `/api/*` endpoints except `/api/auth/login` and `/api/health` require a valid session cookie; unauthenticated requests get a 401.
+
+### Auth
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/auth/login` | Log in with `{email, password}`; sets a session cookie |
+| POST | `/api/auth/logout` | Clears the session cookie |
+| GET | `/api/auth/me` | Returns the current logged-in user, or 401 |
 
 ### Market Data
 | Method | Path | Description |
@@ -271,6 +314,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/chat` | Send a message, receive complete JSON response (message + executed actions) |
+| GET | `/api/chat` | Retrieve chat message history (for restoring the conversation on page load) |
 
 ### System
 | Method | Path | Description |
@@ -290,11 +334,11 @@ There is an OPENROUTER_API_KEY in the .env file in the project root.
 When the user sends a chat message, the backend:
 
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
-2. Loads recent conversation history from the `chat_messages` table
+2. Loads the last 10 messages of conversation history from the `chat_messages` table
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
 4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
 5. Parses the complete structured JSON response
-6. Auto-executes any trades or watchlist changes specified in the response
+6. Auto-executes any trades or watchlist changes specified in the response — if a trade targets a ticker not currently on the watchlist, the ticker is added to the watchlist first (so it has a live price from the shared cache), then the trade executes
 7. Stores the message and executed actions in `chat_messages`
 8. Returns the complete JSON response to the frontend (no token-by-token streaming — Cerebras inference is fast enough that a loading indicator is sufficient)
 
@@ -327,6 +371,10 @@ Trades specified by the LLM execute automatically — no confirmation dialog. Th
 
 If a trade fails validation (e.g., insufficient cash), the error is included in the chat response so the LLM can inform the user.
 
+### Rate Limiting & Cost Control
+
+`/api/chat` is rate-limited per session (e.g., 20 messages/minute) since each call is a paid LLM request against a publicly reachable app — without this, a bug or a bad actor with the login could run up API costs quickly. This is simple in-process rate limiting (no Redis or external service needed — it's a single instance). Trade and watchlist endpoints are intentionally *not* rate-limited: they're free, login-gated, and simulated, so there's nothing costly to protect against.
+
 ### System Prompt Guidance
 
 The LLM should be prompted as "FinAlly, an AI trading assistant" with instructions to:
@@ -335,6 +383,7 @@ The LLM should be prompted as "FinAlly, an AI trading assistant" with instructio
 - Execute trades when the user asks or agrees
 - Manage the watchlist proactively
 - Be concise and data-driven in responses
+- State clearly, when relevant, that this is a simulated portfolio with fake money and not real investment advice
 - Always respond with valid structured JSON
 
 ### LLM Mock Mode
@@ -352,7 +401,8 @@ When `LLM_MOCK=true`, the backend returns deterministic mock responses instead o
 
 The frontend is a single-page application with a dense, terminal-inspired layout. The specific component architecture and layout system is up to the Frontend Engineer, but the UI should include these elements:
 
-- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change %, and a sparkline mini-chart (accumulated from SSE since page load)
+- **Login screen** — shown instead of the terminal UI when there's no valid session; a simple email/password form posting to `/api/auth/login`. On success, redirects to the terminal.
+- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change %, and a sparkline mini-chart (accumulated from SSE since page load; sparklines are ephemeral and reset on reload — not backfilled from history)
 - **Main chart area** — larger chart for the currently selected ticker, with at minimum price over time. Clicking a ticker in the watchlist selects it here.
 - **Portfolio heatmap** — treemap visualization where each rectangle is a position, sized by portfolio weight, colored by P&L (green = profit, red = loss)
 - **P&L chart** — line chart showing total portfolio value over time, using data from `portfolio_snapshots`
@@ -364,10 +414,11 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 ### Technical Notes
 
 - Use `EventSource` for SSE connection to `/api/stream/prices`
-- Canvas-based charting library preferred (Lightweight Charts or Recharts) for performance
+- Use Lightweight Charts (canvas-based) for all charts — built for financial/price data and performs well under frequent streaming updates
 - Price flash effect: on receiving a new price, briefly apply a CSS class with background color transition, then remove it
 - All API calls go to the same origin (`/api/*`) — no CORS configuration needed
 - Tailwind CSS for styling with a custom dark theme
+- A persistent, small disclaimer ("Simulated portfolio — not real money, not investment advice") is shown in the header or footer, since the AI actively suggests and auto-executes trades
 
 ---
 
@@ -393,7 +444,7 @@ FastAPI serves the static frontend files and all API routes on port 8000.
 
 ### Docker Volume
 
-The SQLite database persists via a named Docker volume:
+The SQLite database persists via a named Docker volume. For local/dev use, the app container can be run directly:
 
 ```bash
 docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
@@ -401,13 +452,15 @@ docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
 
 The `db/` directory in the project root maps to `/app/db` in the container. The backend writes `finally.db` to this path.
 
+For production, `docker-compose.yml` runs this same app container alongside a Caddy container (see below) rather than exposing port 8000 directly — `docker-compose up -d` is the standard way to start (or restart) the whole stack on the VPS.
+
 ### Start/Stop Scripts
 
 **`scripts/start_mac.sh`** (macOS/Linux):
 - Builds the Docker image if not already built (or if `--build` flag passed)
 - Runs the container with the volume mount, port mapping, and `.env` file
 - Prints the URL to access the app
-- Optionally opens the browser
+- Opens the browser automatically by default
 
 **`scripts/stop_mac.sh`** (macOS/Linux):
 - Stops and removes the running container
@@ -417,9 +470,19 @@ The `db/` directory in the project root maps to `/app/db` in the container. The 
 
 All scripts should be idempotent — safe to run multiple times.
 
-### Optional Cloud Deployment
+### Production Deployment (VPS)
 
-The container is designed to deploy to AWS App Runner, Render, or any container platform. A Terraform configuration for App Runner may be provided in a `deploy/` directory as a stretch goal, but is not part of the core build.
+The intended production target is a self-managed VPS (e.g., a Droplet or EC2 instance), not a managed container platform — this matters because managed platforms like App Runner often run ephemeral, stateless instances that don't support a persistent local volume the way a VPS does.
+
+- **Reverse proxy + TLS**: `docker-compose.yml` runs two services — `app` (this container) and `caddy` (official Caddy image, config from the repo's `Caddyfile`) — on a shared Docker network. Caddy is the only service that publishes ports 80/443 to the host; it terminates HTTPS via automatic Let's Encrypt and reverse-proxies to `app` by its Compose service name (e.g., `reverse_proxy app:8000`). The `app` service does not publish any port to the host at all.
+- **Firewall**: only 80/443 and SSH are open to the internet on the VPS itself; the app container is unreachable except through Caddy.
+- **Process resilience**: the container runs with `--restart unless-stopped` (or the docker-compose equivalent) so it recovers automatically from crashes or VPS reboots.
+- **Backups**: see §7 — nightly SQLite backup synced off-box. Test the restore procedure at least once before relying on it.
+- **Monitoring**: an external uptime check (e.g., UptimeRobot, or a cron + curl) polls `/api/health`. Backend logs are structured JSON written to stdout, captured via `docker logs`; a log shipper or error tracker (e.g., Sentry) can be added later without changing this plan.
+
+### Optional Alternative: Managed Container Platforms
+
+The container can still deploy to AWS App Runner, Render, or a similar platform if preferred later, but on those platforms `db/` needs a genuinely persistent, network-attached volume (or the app needs to move off SQLite to a managed database) — a local Docker volume mount, as described above, does not carry over. A Terraform configuration for App Runner may be provided in a `deploy/` directory as a stretch goal, but is not part of the core build.
 
 ---
 
@@ -428,6 +491,7 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 ### Unit Tests (within `frontend/` and `backend/`)
 
 **Backend (pytest)**:
+- Auth: password hashing/verification, session creation/expiry, protected routes reject requests without a valid session
 - Market data: simulator generates valid prices, GBM math is correct, Massive API response parsing works, both implementations conform to the abstract interface
 - Portfolio: trade execution logic, P&L calculations, edge cases (selling more than owned, buying with insufficient cash, selling at a loss)
 - LLM: structured output parsing handles all valid schemas, graceful handling of malformed responses, trade validation within chat flow
@@ -447,6 +511,7 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 **Environment**: Tests run with `LLM_MOCK=true` by default for speed and determinism.
 
 **Key Scenarios**:
+- Auth: logging in with correct/incorrect credentials, session persists across reload, protected routes redirect to the login screen when logged out
 - Fresh start: default watchlist appears, $10k balance shown, prices are streaming
 - Add and remove a ticker from the watchlist
 - Buy shares: cash decreases, position appears, portfolio updates
