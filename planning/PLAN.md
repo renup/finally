@@ -115,7 +115,7 @@ finally/
 
 - **`frontend/`** is a self-contained Next.js project. It knows nothing about Python. It talks to the backend via `/api/*` endpoints and `/api/stream/*` SSE endpoints. Internal structure is up to the Frontend Engineer agent.
 - **`backend/`** is a self-contained uv project with its own `pyproject.toml`. It owns all server logic including database initialization, schema, seed data, API routes, SSE streaming, market data, and LLM integration. Internal structure is up to the Backend/Market Data agents.
-- **`backend/db/`** contains schema SQL definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
+- **`backend/db/`** contains the schema as versioned `.sql` files (the `CREATE TABLE` statements, run in order) plus the seed-data logic in Python. The backend lazily initializes the database on first request — running these `.sql` files and seeding default data if the SQLite file doesn't exist or is empty. Once schema changes need to land against a live database (post-launch, per §7), these same `.sql` files become the input to a small migration runner rather than being replaced by one.
 - **`db/`** at the top level is the runtime volume mount point. The SQLite file (`db/finally.db`) is created here by the backend and persists across container restarts via Docker volume.
 - **`planning/`** contains project-wide documentation, including this plan. All agents reference files here as the shared contract.
 - **`test/`** contains Playwright E2E tests and supporting infrastructure (e.g., `docker-compose.test.yml`). Unit tests live within `frontend/` and `backend/` respectively, following each framework's conventions.
@@ -151,7 +151,8 @@ SESSION_SECRET=
 - If `LLM_MOCK=true` → backend returns deterministic mock LLM responses (for E2E tests)
 - The backend reads `.env` from the project root (mounted into the container or read via docker `--env-file`)
 - On first boot, if no row exists in `users`, the backend creates one from `ADMIN_EMAIL` / `ADMIN_PASSWORD` (password is hashed before storage, plaintext is never persisted). This only happens once — changing `ADMIN_EMAIL`/`ADMIN_PASSWORD` later does **not** retroactively update the existing `users` row (so a future in-app "change password" feature isn't silently overwritten on restart). To reset credentials manually before that feature exists, delete the `users` row via `sqlite3 db/finally.db` and restart the container to re-bootstrap
-- Sessions are stateless, signed cookies (signed with `SESSION_SECRET`, e.g. via `itsdangerous` or a JWT) — there is no server-side `sessions` table to manage or expire
+- `ADMIN_EMAIL`, `ADMIN_PASSWORD`, and `SESSION_SECRET` have no built-in defaults — if any is missing or empty, the backend fails fast at startup with a clear error instead of booting with a guessable default or a disabled login. This is the same locally and in production: first launch always means copying `.env.example` to `.env` and filling in real values before `docker run` / `docker compose up`
+- Sessions are stateless, signed cookies (signed with `SESSION_SECRET`, e.g. via `itsdangerous` or a JWT) — there is no server-side `sessions` table to manage or expire. The cookie is set `HttpOnly`, `Secure`, and `SameSite=Lax` (Lax rather than Strict so a normal top-level navigation to the app still carries it), with a fixed expiry (e.g. 7 days) encoded in the signed payload so the server doesn't need to track it. `SameSite=Lax` combined with cookie-only auth means state-changing endpoints (trade, chat, watchlist) aren't reachable via a simple cross-site form or image request, so no separate CSRF token is needed. Logout just clears the cookie client-side — as with any stateless-cookie scheme, a copied cookie stays valid until it expires or `SESSION_SECRET` is rotated (which invalidates all sessions at once)
 
 ### Production Secrets Handling
 
@@ -228,7 +229,7 @@ All tables include a `user_id` column, a foreign key to `users.id`. Today there'
 - `password_hash` TEXT (bcrypt or argon2 — plaintext password is never stored)
 - `created_at` TEXT (ISO timestamp)
 
-**users_profile** — User state (cash balance)
+**user_profiles** — User state (cash balance)
 - `id` TEXT PRIMARY KEY (references `users.id`)
 - `cash_balance` REAL (default: `10000.0`)
 - `created_at` TEXT (ISO timestamp)
@@ -258,7 +259,7 @@ All tables include a `user_id` column, a foreign key to `users.id`. Today there'
 - `price` REAL
 - `executed_at` TEXT (ISO timestamp)
 
-**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution. On a fresh start (no trades yet), the chart simply shows a single point at $10,000 — no synthetic history is backfilled. A background task prunes snapshots older than 7 days to keep the table bounded.
+**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution. On a fresh start (no trades yet), the chart simply shows a single point at $10,000 — no synthetic history is backfilled. A background task prunes snapshots older than 7 days to keep the table bounded — this is a deliberate limit matching the P&L chart's intended use as a short-term activity view; a longer-range view later should down-sample into a separate rollup table rather than extending raw retention.
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (references `users.id`)
 - `total_value` REAL
@@ -291,6 +292,8 @@ All `/api/*` endpoints except `/api/auth/login` and `/api/health` require a vali
 | POST | `/api/auth/logout` | Clears the session cookie |
 | GET | `/api/auth/me` | Returns the current logged-in user, or 401 |
 
+`/api/auth/login` is rate-limited per source IP (e.g. 5 attempts/minute, independent of the per-session chat limiter in §9) to blunt credential brute-forcing against the single admin account — same in-process limiter pattern as §9, no external service required.
+
 ### Market Data
 | Method | Path | Description |
 |--------|------|-------------|
@@ -309,6 +312,8 @@ All `/api/*` endpoints except `/api/auth/login` and `/api/health` require a vali
 | GET | `/api/watchlist` | Current watchlist tickers with latest prices |
 | POST | `/api/watchlist` | Add a ticker: `{ticker}` |
 | DELETE | `/api/watchlist/{ticker}` | Remove a ticker |
+
+Adding a ticker the active market data source can't resolve (a typo, or a symbol the simulator/Massive don't know) returns `400` with an error message rather than silently accepting it — the frontend surfaces this inline, and the same check applies to tickers the LLM chat flow tries to add (see §9).
 
 ### Chat
 | Method | Path | Description |
@@ -338,7 +343,7 @@ When the user sends a chat message, the backend:
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
 4. Calls the LLM via LiteLLM → OpenRouter, requesting structured output, using the cerebras-inference skill
 5. Parses the complete structured JSON response
-6. Auto-executes any trades or watchlist changes specified in the response — if a trade targets a ticker not currently on the watchlist, the ticker is added to the watchlist first (so it has a live price from the shared cache), then the trade executes
+6. Auto-executes any trades or watchlist changes specified in the response — if a trade targets a ticker not currently on the watchlist, the ticker is added to the watchlist first (so it has a live price from the shared cache), then the trade executes. If that ticker can't be resolved by the market data source (see §8 Watchlist), the add and the trade both fail and the error is returned to the LLM the same way a failed cash/share validation is (see **Auto-Execution** below), so it can explain the failure instead of silently skipping it
 7. Stores the message and executed actions in `chat_messages`
 8. Returns the complete JSON response to the frontend (no token-by-token streaming — Cerebras inference is fast enough that a loading indicator is sufficient)
 

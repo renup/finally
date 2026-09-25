@@ -33,6 +33,8 @@ the demo script).
 | [`archive/MASSIVE_API.md`](archive/MASSIVE_API.md) | Massive API research: auth, rate limits, the multi-ticker snapshot endpoint used for live prices, and the EOD/historical endpoints (grouped-daily, open-close, range aggregates) available for future use |
 | [`archive/MARKET_INTERFACE.md`](archive/MARKET_INTERFACE.md) | The unified interface design — `PriceUpdate`, `PriceCache`, `MarketDataSource`, the factory, and the SSE consumer |
 | [`archive/MARKET_SIMULATOR.md`](archive/MARKET_SIMULATOR.md) | The GBM simulator: price model, Cholesky-based sector correlation, seed data, code structure |
+| [`archive/MARKET_DATA_DESIGN.md`](archive/MARKET_DATA_DESIGN.md) | Superseded by the three docs above — kept for historical context on the original design pass |
+| [`archive/MARKET_DATA_REVIEW.md`](archive/MARKET_DATA_REVIEW.md) | Code review from the initial implementation. Its one **must-fix** (missing `[tool.hatch.build.targets.wheel]` in `pyproject.toml`) is already resolved; the remaining items are minor/nice-to-have, some still open (see its §5) |
 
 ## Not yet used, documented for later
 
