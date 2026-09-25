@@ -26,6 +26,12 @@ from app.market import PriceCache, PriceUpdate, MarketDataSource, create_market_
 See `backend/CLAUDE.md` for the day-to-day developer reference (imports, running tests,
 the demo script).
 
+> **Review (2026-09-25):** see [`MARKET_DATA_DESIGN.md`](MARKET_DATA_DESIGN.md) — the v2 detailed
+> design and requirements review. It found that the Massive path currently writes **no
+> prices** against the real SDK (reads a non-existent `last_trade.timestamp`), plus gaps
+> against the current `PLAN.md` (SSE auth, daily change %, held-position pricing, feed
+> health). The simulator path is unaffected. Fix checklist is in its §12.
+
 ## Where to look for more detail
 
 | Document | Covers |
